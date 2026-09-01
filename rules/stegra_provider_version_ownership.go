@@ -2,10 +2,13 @@ package rules
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	version "github.com/hashicorp/go-version"
+	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/terraform-linters/tflint-plugin-sdk/tflint"
 	"github.com/zclconf/go-cty/cty"
@@ -34,6 +37,17 @@ type providerVersionOwnershipConfig struct {
 	ModuleDirectories []string `hclext:"module_directories,optional"`
 }
 
+type rootProviderOwnership struct {
+	sources         map[string]struct{}
+	issueRange      hcl.Range
+	hasLocalModules bool
+}
+
+type moduleProviderRequirement struct {
+	source     string
+	modulePath string
+}
+
 func (r *StegraProviderVersionOwnershipRule) Check(runner tflint.Runner) error {
 	cfg := providerVersionOwnershipConfig{}
 	if err := runner.DecodeRuleConfig(r.Name(), &cfg); err != nil {
@@ -52,6 +66,7 @@ func (r *StegraProviderVersionOwnershipRule) Check(runner tflint.Runner) error {
 	if err != nil {
 		return err
 	}
+	rootOwnership := map[string]*rootProviderOwnership{}
 
 	for filename, file := range files {
 		if strings.HasSuffix(filename, ".tf.json") || filepath.Ext(filename) == ".json" {
@@ -66,10 +81,27 @@ func (r *StegraProviderVersionOwnershipRule) Check(runner tflint.Runner) error {
 		if isRoot && isModule {
 			return fmt.Errorf("%s: %s matches both root_directories and module_directories", r.Name(), filename)
 		}
+		directory := filepath.ToSlash(filepath.Dir(filepath.Clean(filename)))
 
 		body, ok := file.Body.(*hclsyntax.Body)
 		if !ok {
 			continue
+		}
+		if isRoot {
+			for _, block := range body.Blocks {
+				if !isLocalModuleBlock(block) {
+					continue
+				}
+				ownership, exists := rootOwnership[directory]
+				if !exists {
+					ownership = &rootProviderOwnership{
+						sources:    map[string]struct{}{},
+						issueRange: block.TypeRange,
+					}
+					rootOwnership[directory] = ownership
+				}
+				ownership.hasLocalModules = true
+			}
 		}
 		for _, terraformBlock := range body.Blocks {
 			if terraformBlock.Type != "terraform" {
@@ -79,7 +111,22 @@ func (r *StegraProviderVersionOwnershipRule) Check(runner tflint.Runner) error {
 				if requiredProvidersBlock.Type != "required_providers" {
 					continue
 				}
+				if isRoot {
+					if ownership, exists := rootOwnership[directory]; !exists {
+						rootOwnership[directory] = &rootProviderOwnership{
+							sources:    map[string]struct{}{},
+							issueRange: requiredProvidersBlock.TypeRange,
+						}
+					} else {
+						ownership.issueRange = requiredProvidersBlock.TypeRange
+					}
+				}
 				for providerName, providerAttribute := range requiredProvidersBlock.Body.Attributes {
+					if isRoot {
+						if source, hasSource := requiredProviderStringAttribute(providerAttribute.Expr, "source"); hasSource {
+							rootOwnership[directory].sources[normalizeProviderSource(source)] = struct{}{}
+						}
+					}
 					versionExpression, hasVersion := requiredProviderVersionExpression(providerAttribute.Expr)
 					if isModule && hasVersion {
 						if err := runner.EmitIssue(
@@ -121,22 +168,68 @@ func (r *StegraProviderVersionOwnershipRule) Check(runner tflint.Runner) error {
 		}
 	}
 
+	originalWorkingDirectory, err := runner.GetOriginalwd()
+	if err != nil {
+		return err
+	}
+	for rootDirectory, ownership := range rootOwnership {
+		if !ownership.hasLocalModules {
+			continue
+		}
+		moduleProviders, err := transitiveModuleProviderRequirements(originalWorkingDirectory, rootDirectory)
+		if err != nil {
+			return err
+		}
+		for _, requirement := range moduleProviders {
+			if _, exists := ownership.sources[requirement.source]; exists {
+				continue
+			}
+			if err := runner.EmitIssue(
+				r,
+				fmt.Sprintf(
+					"root workspace must declare an exact version for transitive module provider %q (used by %s)",
+					requirement.source,
+					requirement.modulePath,
+				),
+				ownership.issueRange,
+			); err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
 func requiredProviderVersionExpression(expression hclsyntax.Expression) (hclsyntax.Expression, bool) {
+	return requiredProviderObjectAttribute(expression, "version")
+}
+
+func requiredProviderObjectAttribute(expression hclsyntax.Expression, attributeName string) (hclsyntax.Expression, bool) {
 	object, ok := expression.(*hclsyntax.ObjectConsExpr)
 	if !ok {
 		return nil, false
 	}
 	for _, item := range object.Items {
 		key, diagnostics := item.KeyExpr.Value(nil)
-		if diagnostics.HasErrors() || !key.IsKnown() || key.Type() != cty.String || key.AsString() != "version" {
+		if diagnostics.HasErrors() || !key.IsKnown() || key.IsNull() || key.Type() != cty.String || key.AsString() != attributeName {
 			continue
 		}
 		return item.ValueExpr, true
 	}
 	return nil, false
+}
+
+func requiredProviderStringAttribute(expression hclsyntax.Expression, attributeName string) (string, bool) {
+	attributeExpression, exists := requiredProviderObjectAttribute(expression, attributeName)
+	if !exists {
+		return "", false
+	}
+	value, diagnostics := attributeExpression.Value(nil)
+	if diagnostics.HasErrors() || !value.IsKnown() || value.IsNull() || value.Type() != cty.String {
+		return "", false
+	}
+	return value.AsString(), true
 }
 
 func isExactProviderVersion(constraint string) bool {
@@ -170,4 +263,184 @@ func isUnderAnyDirectory(path string, directories []string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeProviderSource(source string) string {
+	return strings.ToLower(strings.TrimPrefix(source, "registry.terraform.io/"))
+}
+
+func isLocalModuleBlock(block *hclsyntax.Block) bool {
+	if block.Type != "module" {
+		return false
+	}
+	sourceAttribute, exists := block.Body.Attributes["source"]
+	if !exists {
+		return false
+	}
+	sourceValue, diagnostics := sourceAttribute.Expr.Value(nil)
+	if diagnostics.HasErrors() || !sourceValue.IsKnown() || sourceValue.IsNull() || sourceValue.Type() != cty.String {
+		return false
+	}
+	source := strings.SplitN(sourceValue.AsString(), "?", 2)[0]
+	return strings.HasPrefix(source, "./") || strings.HasPrefix(source, "../")
+}
+
+func transitiveModuleProviderRequirements(repositoryRoot, rootDirectory string) ([]moduleProviderRequirement, error) {
+	repositoryRoot, err := filepath.Abs(repositoryRoot)
+	if err != nil {
+		return nil, err
+	}
+	repositoryRoot, err = filepath.EvalSymlinks(repositoryRoot)
+	if err != nil {
+		return nil, err
+	}
+	rootPath := filepath.Join(repositoryRoot, filepath.FromSlash(rootDirectory))
+	pending, err := localModulePaths(rootPath, repositoryRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	requirements := map[string]moduleProviderRequirement{}
+	visited := map[string]struct{}{}
+	for len(pending) > 0 {
+		modulePath := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if _, exists := visited[modulePath]; exists {
+			continue
+		}
+		visited[modulePath] = struct{}{}
+
+		relativeModulePath, err := filepath.Rel(repositoryRoot, modulePath)
+		if err != nil {
+			return nil, err
+		}
+		providerSources, err := providerSourcesInDirectory(modulePath)
+		if err != nil {
+			return nil, err
+		}
+		for _, source := range providerSources {
+			normalizedSource := normalizeProviderSource(source)
+			if _, exists := requirements[normalizedSource]; !exists {
+				requirements[normalizedSource] = moduleProviderRequirement{
+					source:     normalizedSource,
+					modulePath: filepath.ToSlash(relativeModulePath),
+				}
+			}
+		}
+
+		children, err := localModulePaths(modulePath, repositoryRoot)
+		if err != nil {
+			return nil, err
+		}
+		pending = append(pending, children...)
+	}
+
+	result := make([]moduleProviderRequirement, 0, len(requirements))
+	for _, requirement := range requirements {
+		result = append(result, requirement)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].source < result[j].source
+	})
+	return result, nil
+}
+
+func providerSourcesInDirectory(directory string) ([]string, error) {
+	sources := []string{}
+	err := visitTerraformBodies(directory, func(_ string, body *hclsyntax.Body) error {
+		for _, terraformBlock := range body.Blocks {
+			if terraformBlock.Type != "terraform" {
+				continue
+			}
+			for _, requiredProvidersBlock := range terraformBlock.Body.Blocks {
+				if requiredProvidersBlock.Type != "required_providers" {
+					continue
+				}
+				for _, providerAttribute := range requiredProvidersBlock.Body.Attributes {
+					if source, exists := requiredProviderStringAttribute(providerAttribute.Expr, "source"); exists {
+						sources = append(sources, source)
+					}
+				}
+			}
+		}
+		return nil
+	})
+	return sources, err
+}
+
+func localModulePaths(directory, repositoryRoot string) ([]string, error) {
+	paths := []string{}
+	err := visitTerraformBodies(directory, func(_ string, body *hclsyntax.Body) error {
+		for _, moduleBlock := range body.Blocks {
+			if moduleBlock.Type != "module" {
+				continue
+			}
+			sourceAttribute, exists := moduleBlock.Body.Attributes["source"]
+			if !exists {
+				continue
+			}
+			sourceValue, diagnostics := sourceAttribute.Expr.Value(nil)
+			if diagnostics.HasErrors() || !sourceValue.IsKnown() || sourceValue.IsNull() || sourceValue.Type() != cty.String {
+				continue
+			}
+			source := strings.SplitN(sourceValue.AsString(), "?", 2)[0]
+			if !strings.HasPrefix(source, "./") && !strings.HasPrefix(source, "../") {
+				continue
+			}
+
+			candidate := filepath.Clean(filepath.Join(directory, filepath.FromSlash(source)))
+			candidate, err := filepath.EvalSymlinks(candidate)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return err
+			}
+			relativeCandidate, err := filepath.Rel(repositoryRoot, candidate)
+			if err != nil || relativeCandidate == ".." || strings.HasPrefix(relativeCandidate, ".."+string(filepath.Separator)) {
+				continue
+			}
+			info, err := os.Stat(candidate)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return err
+			}
+			if info.IsDir() {
+				paths = append(paths, candidate)
+			}
+		}
+		return nil
+	})
+	return paths, err
+}
+
+func visitTerraformBodies(directory string, visit func(string, *hclsyntax.Body) error) error {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".tf" {
+			continue
+		}
+		filename := filepath.Join(directory, entry.Name())
+		source, err := os.ReadFile(filename)
+		if err != nil {
+			return err
+		}
+		file, diagnostics := hclsyntax.ParseConfig(source, filename, hcl.Pos{Line: 1, Column: 1})
+		if diagnostics.HasErrors() {
+			return fmt.Errorf("failed to parse %s while checking provider ownership: %s", filename, diagnostics.Error())
+		}
+		body, ok := file.Body.(*hclsyntax.Body)
+		if !ok {
+			continue
+		}
+		if err := visit(filename, body); err != nil {
+			return err
+		}
+	}
+	return nil
 }
