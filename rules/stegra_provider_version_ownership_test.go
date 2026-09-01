@@ -3,6 +3,7 @@ package rules
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/terraform-linters/tflint-plugin-sdk/helper"
@@ -208,6 +209,84 @@ module "parent" {
 	}
 	if requirements[1].source != "hashicorp/random" || requirements[1].modulePath != "modules/child" {
 		t.Fatalf("unexpected second requirement: %#v", requirements[1])
+	}
+}
+
+func TestStegraProviderVersionOwnershipRuleRejectsMissingTransitiveProvider(t *testing.T) {
+	rule := NewStegraProviderVersionOwnershipRule()
+	originalWorkingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryRoot, err := os.MkdirTemp(originalWorkingDirectory, ".provider-ownership-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(repositoryRoot); err != nil {
+			t.Errorf("failed to clean test repository: %s", err)
+		}
+	})
+	rootDirectory := filepath.Join(repositoryRoot, "environments", "prod", "network")
+	moduleDirectory := filepath.Join(repositoryRoot, "modules", "network")
+	for _, directory := range []string{rootDirectory, moduleDirectory} {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rootMain := `
+module "network" {
+  source = "../../../modules/network"
+}
+`
+	rootProviders := `
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "6.51.0"
+    }
+  }
+}
+`
+	writeTerraformTestFile(t, filepath.Join(rootDirectory, "main.tf"), rootMain)
+	writeTerraformTestFile(t, filepath.Join(rootDirectory, "provider.tf"), rootProviders)
+	writeTerraformTestFile(t, filepath.Join(moduleDirectory, "provider.tf"), `
+terraform {
+  required_providers {
+    random = {
+      source = "hashicorp/random"
+    }
+  }
+}
+`)
+
+	relativeRootDirectory, err := filepath.Rel(originalWorkingDirectory, rootDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relativeRootDirectory = filepath.ToSlash(relativeRootDirectory)
+
+	runner := helper.TestRunner(t, map[string]string{
+		filepath.ToSlash(filepath.Join(relativeRootDirectory, "main.tf")):     rootMain,
+		filepath.ToSlash(filepath.Join(relativeRootDirectory, "provider.tf")): rootProviders,
+		".tflint.hcl": `
+rule "stegra_provider_version_ownership" {
+  enabled            = true
+  root_directories   = ["` + relativeRootDirectory + `"]
+  module_directories = ["modules"]
+}
+`,
+	})
+	if err := rule.Check(runner); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	if len(runner.Issues) != 1 {
+		t.Fatalf("expected one missing transitive provider issue, got %#v", runner.Issues)
+	}
+	if !strings.Contains(runner.Issues[0].Message, `transitive module provider "hashicorp/random"`) {
+		t.Fatalf("unexpected issue: %s", runner.Issues[0].Message)
 	}
 }
 
