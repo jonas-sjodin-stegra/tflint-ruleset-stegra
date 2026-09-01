@@ -14,6 +14,7 @@ This is a custom TFLint ruleset focused on readable, consistent Terraform code, 
 - `stegra_no_this_resource_name`: Forbids using the resource name `this`. Auto-fix renames to `main` and updates `<type>.this` traversals in expressions to `<type>.main` (strings/comments are left untouched).
 - `stegra_empty_block_one_line`: Enforces that empty blocks use single-line form `{}`. Auto-fix collapses two-line empty blocks.
 - `stegra_no_blank_lines_in_required_providers`: Disallows blank lines anywhere inside `terraform` → `required_providers`. Auto-fix removes only the empty lines (keeps comments).
+- `stegra_provider_version_ownership`: Requires reusable modules to omit provider versions and runnable roots to declare exact versions, keeping provider-version ownership next to each root lockfile.
 
 ## Requirements
 
@@ -62,6 +63,7 @@ tflint
 |stegra_no_this_resource_name|Forbids resource name `this`|ERROR|✔|Rename to `main` + update expression refs|
 |stegra_empty_block_one_line|Enforces single-line `{}` for empty blocks|ERROR|✔|Collapse to `{}`|
 |stegra_no_blank_lines_in_required_providers|Disallows blank lines anywhere in required_providers|ERROR|✔|Remove blank lines|
+|stegra_provider_version_ownership|Keeps module providers versionless and requires exact versions in roots|ERROR|Configurable|N/A|
 
 ## Auto-fix Examples
 
@@ -284,6 +286,56 @@ rule "stegra_newline_after_keywords" {
 rule "stegra_provider_configuration_locations" {
   enabled             = true
   allowed_directories = ["environments"]
+}
+```
+
+- stegra_provider_version_ownership
+  - Required options: `root_directories` and `module_directories` (path prefixes relative to the repository root)
+  - Runnable roots must use one exact provider version, while reusable modules must omit the `version` attribute.
+  - This rule checks declarations in the current Terraform directory. A separate graph-aware check is still needed to verify that a root declares providers used only by child modules and that its lockfile matches.
+  - Example:
+
+```hcl
+rule "stegra_provider_version_ownership" {
+  enabled            = true
+  root_directories   = ["environments"]
+  module_directories = ["modules"]
+}
+```
+
+Failing reusable module:
+
+```hcl
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "6.51.0"
+    }
+  }
+}
+```
+
+Passing reusable module and root workspace:
+
+```hcl
+# modules/example/provider.tf
+terraform {
+  required_providers {
+    aws = {
+      source = "hashicorp/aws"
+    }
+  }
+}
+
+# environments/prod/example/provider.tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "6.51.0"
+    }
+  }
 }
 ```
 
